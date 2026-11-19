@@ -27,6 +27,12 @@ if [ -z "$SHELL_TOOLS_DIR" ] || [ ! -d "$SHELL_TOOLS_DIR/functions" ]; then
   return 1
 fi
 
+# Real scripts live in bin/ (see "Adding a tool" in the README).
+case ":$PATH:" in
+  *":$SHELL_TOOLS_DIR/bin:"*) ;;
+  *) PATH="$SHELL_TOOLS_DIR/bin:$PATH" ;;
+esac
+
 for _st_file in "$SHELL_TOOLS_DIR"/functions/*.sh; do
   [ -r "$_st_file" ] && . "$_st_file"
 done

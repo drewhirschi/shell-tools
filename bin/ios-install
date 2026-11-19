@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+# ios-install — build a signed Release app on a build Mac and install it on the iPhone.
+# One script for every iOS project; see ios/README.md for the why behind each step.
+set -euo pipefail
+
+TOOL_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)"
+BRIDGE_SRC="$TOOL_DIR/ios/coredevice-tailnet-bridge.py"
+SSH=(ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10)
+RSYNC_SSH='ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10'
+# Non-interactive SSH skips the Mac's shell profile, so set up the toolchain here.
+REMOTE_ENV='export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export LANG=en_US.UTF-8'
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ios-install [options] [project]     sync, build, verify, install, launch
+  ios-install doctor [options] [project]
+  ios-install projects                list known project configs
+
+project   a name from ios/projects/<name>.conf, or omitted to use the nearest
+          .ios-install.conf above the current directory.
+
+Options:
+  --host NAME        build Mac (default: first of HOSTS that sees the phone as available)
+  --source DIR       local checkout to sync (default: LOCAL_ROOT from the config);
+                     use this to build a worktree instead of the main checkout
+  --config FILE      explicit project config
+  --device NAME      device name as devicectl lists it (default: DEVICE or drew-25)
+  --phone-tailscale  phone's Tailscale name or IP (default: the only iOS peer)
+  --skip-sync        do not rsync the source
+  --skip-prebuild    do not run the project's PREBUILD step
+  --skip-build       reuse the app already built on the host
+  --no-install       stop after verifying the signed app
+  --no-launch        install without launching
+  --bridge MODE      auto (default), always, or never
+  --force            build even if another xcodebuild is running for this scheme
+  -n, --dry-run      read-only checks, then print what would run
+  -h, --help
+EOF
+}
+
+say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- arguments
+COMMAND=install
+HOST='' SOURCE='' CONFIG='' PROJECT_ARG='' DEVICE_ARG='' PHONE_TS_ARG=''
+SKIP_SYNC=0 SKIP_PREBUILD=0 SKIP_BUILD=0 NO_INSTALL=0 NO_LAUNCH=0 FORCE=0 DRY=0
+BRIDGE_MODE=auto
+while [ $# -gt 0 ]; do
+  case "$1" in
+    doctor|projects) [ -z "$PROJECT_ARG" ] && [ "$COMMAND" = install ] && COMMAND=$1 || PROJECT_ARG=$1 ;;
+    --host) HOST=${2:?--host needs a value}; shift ;;
+    --source) SOURCE=${2:?--source needs a value}; shift ;;
+    --config) CONFIG=${2:?--config needs a value}; shift ;;
+    --device) DEVICE_ARG=${2:?--device needs a value}; shift ;;
+    --phone-tailscale) PHONE_TS_ARG=${2:?--phone-tailscale needs a value}; shift ;;
+    --bridge) BRIDGE_MODE=${2:?--bridge needs a value}; shift ;;
+    --skip-sync) SKIP_SYNC=1 ;;
+    --skip-prebuild) SKIP_PREBUILD=1 ;;
+    --skip-build) SKIP_BUILD=1 ;;
+    --no-install) NO_INSTALL=1 ;;
+    --no-launch) NO_LAUNCH=1 ;;
+    --force) FORCE=1 ;;
+    -n|--dry-run) DRY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; die "unknown option $1" ;;
+    *) [ -z "$PROJECT_ARG" ] || die "unexpected argument $1"; PROJECT_ARG=$1 ;;
+  esac
+  shift
+done
+case "$BRIDGE_MODE" in auto|always|never) ;; *) die "--bridge must be auto, always or never" ;; esac
+
+if [ "$COMMAND" = projects ]; then
+  for f in "$TOOL_DIR"/ios/projects/*.conf; do
+    [ -e "$f" ] && printf '%s\t%s\n' "$(basename "$f" .conf)" "$f"
+  done
+  exit 0
+fi
+
+# ---------------------------------------------------------------- config
+# Defaults; a project config overrides any of these.
+HOSTS=(terakar jsn)          # build Macs, in preference order
+SSH_USER=drew
+TEAM=C9P58ZP4AQ
+DEVICE=drew-25
+PHONE_TAILSCALE=''           # Tailscale name or IP; empty = the only iOS peer
+NAME='' LOCAL_ROOT='' REMOTE_DIR='' XCODE_DIR=. PROJECT='' WORKSPACE='' SCHEME=''
+BUNDLE_ID='' DERIVED_DATA=build-device PRODUCT='' PREBUILD=''
+SYNC=() SYNC_EXCLUDES=() XCODEBUILD_ARGS=() REQUIRE_ENTITLEMENTS=()
+
+find_config() {
+  if [ -n "$CONFIG" ]; then [ -f "$CONFIG" ] || die "no config at $CONFIG"; return; fi
+  if [ -n "$PROJECT_ARG" ]; then
+    CONFIG="$TOOL_DIR/ios/projects/$PROJECT_ARG.conf"
+    [ -f "$CONFIG" ] || die "unknown project '$PROJECT_ARG' (see: ios-install projects)"
+    return
+  fi
+  local dir=$PWD
+  while [ "$dir" != / ]; do
+    if [ -f "$dir/.ios-install.conf" ]; then CONFIG="$dir/.ios-install.conf"; return; fi
+    dir=$(dirname "$dir")
+  done
+}
+
+find_config
+if [ -n "$CONFIG" ]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG"
+  # A repo-local config describes the repo it sits in.
+  [ -n "$LOCAL_ROOT" ] || LOCAL_ROOT=$(cd "$(dirname "$CONFIG")" && pwd)
+  [ -n "$NAME" ] || NAME=$(basename "$CONFIG" .conf)
+  [ -n "$SOURCE" ] && LOCAL_ROOT=$SOURCE
+  LOCAL_ROOT=${LOCAL_ROOT/#\~/$HOME}
+  [ -n "$PRODUCT" ] || PRODUCT="$SCHEME.app"
+  for required in REMOTE_DIR SCHEME BUNDLE_ID; do
+    [ -n "${!required}" ] || die "$CONFIG must set $required"
+  done
+  [ -n "$PROJECT$WORKSPACE" ] || die "$CONFIG must set PROJECT or WORKSPACE"
+  [ ${#SYNC[@]} -gt 0 ] || die "$CONFIG must set SYNC"
+elif [ "$COMMAND" = install ]; then
+  usage >&2; die "no project given and no .ios-install.conf found above $PWD"
+fi
+[ -n "$DEVICE_ARG" ] && DEVICE=$DEVICE_ARG
+[ -n "$PHONE_TS_ARG" ] && PHONE_TAILSCALE=$PHONE_TS_ARG
+[ -n "$HOST" ] && HOSTS=("$HOST")
+
+# ---------------------------------------------------------------- remote helpers
+# Run a bash script (stdin) on a Mac. Values travel as %q-quoted assignments in
+# a preamble, never spliced into the script text. The remote shell reads the
+# whole script before running it, so a command that reads stdin (xcodebuild,
+# devicectl) cannot swallow the rest of the script.
+remote() {
+  local host=$1; shift
+  { printf '%s\n' "$REMOTE_ENV"; for assignment in "$@"; do printf '%s=%q\n' "${assignment%%=*}" "${assignment#*=}"; done; cat; } |
+    "${SSH[@]}" "$SSH_USER@$host" "/bin/bash -c 'eval \"\$(cat)\"'"
+}
+
+# Read-only facts about one Mac, as KEY=VALUE lines stored in FACTS[host.KEY].
+declare -A FACTS
+probe_host() {
+  local host=$1 out key value
+  FACTS[$host.REACHABLE]=no
+  out=$(remote "$host" "DEVICE=$DEVICE" "SCHEME=$SCHEME" 2>/dev/null <<'REMOTE'
+echo "REACHABLE=yes"
+echo "HOME=$HOME"
+echo "UID=$(id -u)"
+echo "XCODE=$(xcodebuild -version 2>/dev/null | tr '\n' ' ')"
+launchctl print "gui/$(id -u)" >/dev/null 2>&1 && echo GUI=yes || echo GUI=no
+interface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+echo "LAN_IP=$(ipconfig getifaddr "$interface" 2>/dev/null)"
+echo "IDENTITIES=$(security find-identity -v -p codesigning 2>/dev/null | grep -c 'Apple Development')"
+echo "XCODEBUILDS=$(pgrep -f '/usr/bin/xcodebuild' | wc -l | tr -d ' ')"
+[ -n "$SCHEME" ] && echo "SCHEME_BUILDS=$(pgrep -f "xcodebuild.*-scheme $SCHEME " | wc -l | tr -d ' ')"
+json=$(mktemp); table=$(mktemp)
+xcrun devicectl list devices -q --json-output "$json" >/dev/null 2>&1
+xcrun devicectl list devices >"$table" 2>/dev/null
+/usr/bin/python3 - "$json" "$table" "$DEVICE" <<'PY'
+import json, re, sys
+try:
+    devices = json.load(open(sys.argv[1]))["result"]["devices"]
+except Exception:
+    devices = []
+match = [d for d in devices
+         if d.get("deviceProperties", {}).get("name") == sys.argv[3]
+         and d.get("hardwareProperties", {}).get("reality", "physical") == "physical"]
+if not match:
+    print("DEV_STATE=absent")
+else:
+    d = match[0]
+    udid = d.get("hardwareProperties", {}).get("udid", "")
+    state = "unknown"
+    for line in open(sys.argv[2]):
+        columns = re.split(r"\s{2,}", line.strip())
+        for index, column in enumerate(columns[:-1]):
+            if udid and udid in column:
+                state = columns[index + 1]
+    print("DEV_ID=" + d["identifier"])
+    print("DEV_UDID=" + udid)
+    print("DEV_STATE=" + state)
+    print("DEV_PAIRING=" + str(d.get("connectionProperties", {}).get("pairingState")))
+    print("DEV_TRANSPORT=" + str(d.get("connectionProperties", {}).get("transportType")))
+PY
+rm -f "$json" "$table"
+REMOTE
+  ) || return 0
+  while IFS='=' read -r key value; do
+    [ -n "$key" ] && FACTS[$host.$key]=$value
+  done <<<"$out"
+}
+fact() { printf '%s' "${FACTS[$1.$2]:-}"; }
+device_available() { case "$(fact "$1" DEV_STATE)" in available*|connected*) return 0 ;; *) return 1 ;; esac; }
+
+# ---------------------------------------------------------------- phone discovery
+PHONE_TS_IP='' PHONE_TS_NOTE=''
+discover_phone_tailscale() {
+  command -v tailscale >/dev/null || { PHONE_TS_NOTE='tailscale is not installed here'; return 0; }
+  local found
+  found=$(tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+want = sys.argv[1].lower()
+peers = list(json.load(sys.stdin).get("Peer", {}).values())
+def names(p):
+    return {p.get("HostName", "").lower(), p.get("DNSName", "").split(".")[0].lower(), *p.get("TailscaleIPs", [])}
+chosen = [p for p in peers if want in names(p)] if want else [p for p in peers if p.get("OS") == "iOS"]
+if len(chosen) != 1:
+    print("NOTE=%d matching Tailscale peers; set PHONE_TAILSCALE or --phone-tailscale" % len(chosen))
+else:
+    p = chosen[0]
+    ip = next((a for a in p.get("TailscaleIPs", []) if "." in a), "")
+    print("IP=" + ip)
+    print("NOTE=%s (%s)" % (p.get("DNSName", "").split(".")[0] or p.get("HostName"), "online" if p.get("Online") else "OFFLINE: open Tailscale on the phone"))
+' "$PHONE_TAILSCALE") || return 0
+  PHONE_TS_IP=$(sed -n 's/^IP=//p' <<<"$found")
+  PHONE_TS_NOTE=$(sed -n 's/^NOTE=//p' <<<"$found")
+}
+
+# The phone's _remotepairing advert as seen from this machine's LAN. Its
+# instance and authTag rotate every few minutes, so capture right before use.
+ADVERT_INSTANCE='' ADVERT_HOST='' ADVERT_IP='' ADVERT_PORT='' ADVERT_TXT=()
+discover_advert() {
+  ADVERT_INSTANCE=''
+  command -v avahi-browse >/dev/null || return 0
+  local parsed
+  parsed=$(timeout 10 avahi-browse -rtp _remotepairing._tcp 2>/dev/null | python3 -c '
+import re, sys
+device = sys.argv[1].lower()
+decode = lambda s: re.sub(r"\\(\d{3})", lambda m: chr(int(m.group(1))), s)
+rows = [l.rstrip("\n").split(";", 9) for l in sys.stdin if l.startswith("=")]
+rows = [r for r in rows if len(r) == 10 and r[2] == "IPv4"]
+rows = [r for r in rows if r[6].lower().startswith(device + ".")] or rows
+if rows:
+    r = rows[0]
+    print(decode(r[3])); print(r[6]); print(r[7]); print(r[8])
+    for item in re.findall("\"([^\"]*)\"", r[9]):
+        print(decode(item))
+' "$DEVICE") || return 0
+  [ -n "$parsed" ] || return 0
+  mapfile -t lines <<<"$parsed"
+  ADVERT_INSTANCE=${lines[0]} ADVERT_HOST=${lines[1]} ADVERT_IP=${lines[2]} ADVERT_PORT=${lines[3]}
+  ADVERT_TXT=("${lines[@]:4}")
+}
+
+# The tunnel ports move between sessions: relay whatever the phone has open now
+# plus a window around it. The bridge accepts at most 350 ports in total.
+phone_tunnel_ports() {
+  python3 - "$1" <<'PY'
+import asyncio, sys
+async def probe(port, gate):
+    async with gate:
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection(sys.argv[1], port), 0.8)
+            writer.close()
+            return port
+        except Exception:
+            return None
+async def main():
+    gate = asyncio.Semaphore(800)
+    found = sorted(p for p in await asyncio.gather(*[probe(p, gate) for p in range(49153, 65536)]) if p and p != 62078)
+    low = max(49153, (found[0] if found else 56150) - 120)
+    high = min(65535, low + 300)
+    print(",".join([f"{low}-{high}"] + [str(p) for p in found if not low <= p <= high][:40]))
+asyncio.run(main())
+PY
+}
+
+# ---------------------------------------------------------------- doctor
+doctor() {
+  local problems=0 host usable=''
+  say "This machine"
+  for tool in ssh rsync python3 tailscale avahi-browse; do
+    if command -v "$tool" >/dev/null; then info "ok       $tool"; else info "MISSING  $tool"; problems=$((problems + 1)); fi
+  done
+  [ -f "$BRIDGE_SRC" ] && info "ok       bridge script" || { info "MISSING  $BRIDGE_SRC"; problems=$((problems + 1)); }
+
+  say "Phone ($DEVICE)"
+  discover_phone_tailscale
+  info "tailscale  ${PHONE_TS_IP:-?}  $PHONE_TS_NOTE"
+  discover_advert
+  if [ -n "$ADVERT_INSTANCE" ]; then
+    info "LAN advert $ADVERT_HOST at $ADVERT_IP:$ADVERT_PORT (bridge can be used from here)"
+  else
+    info "LAN advert none seen: phone locked, off Wi-Fi, or on another LAN (bridge cannot start from here)"
+  fi
+
+  for host in "${HOSTS[@]}"; do
+    say "Build Mac $host"
+    probe_host "$host"
+    if [ "$(fact "$host" REACHABLE)" != yes ]; then info "UNREACHABLE over ssh as $SSH_USER@$host"; continue; fi
+    info "xcode      $(fact "$host" XCODE)"
+    info "LAN ip     $(fact "$host" LAN_IP)"
+    info "desktop    $([ "$(fact "$host" GUI)" = yes ] && echo 'logged in (signed builds can run)' || echo 'NOT logged in: signed builds will fail')"
+    info "signing    $(fact "$host" IDENTITIES) Apple Development identities visible over ssh"
+    info "xcodebuild $(fact "$host" XCODEBUILDS) running now"
+    case "$(fact "$host" DEV_STATE)" in
+      absent) info "phone      not known to this Mac: pair it once in Xcode (USB or same Wi-Fi)" ;;
+      *) info "phone      $(fact "$host" DEV_STATE), pairing=$(fact "$host" DEV_PAIRING), transport=$(fact "$host" DEV_TRANSPORT)"
+         info "           CoreDevice $(fact "$host" DEV_ID), UDID $(fact "$host" DEV_UDID)" ;;
+    esac
+    if [ -n "$CONFIG" ]; then
+      remote "$host" "DIR=$REMOTE_DIR" "XDIR=$XCODE_DIR" "DD=$DERIVED_DATA" "PRODUCT=$PRODUCT" <<'REMOTE' | sed 's/^/    /'
+if [ -d "$HOME/$DIR" ]; then echo "checkout   ~/$DIR"; else echo "checkout   ~/$DIR missing (first sync creates it)"; fi
+app="$HOME/$DIR/$XDIR/$DD/Build/Products/Release-iphoneos/$PRODUCT"
+if [ -d "$app" ]; then echo "last build $(stat -f '%Sm' "$app")"; else echo "last build none"; fi
+true
+REMOTE
+    fi
+    if [ "$(fact "$host" GUI)" = yes ] && [ -z "$usable" ]; then
+      if device_available "$host"; then usable="$host (direct)"
+      elif [ "$(fact "$host" DEV_PAIRING)" = paired ] && [ -n "$ADVERT_INSTANCE" ] && [ -n "$PHONE_TS_IP" ]; then usable="$host (through the tailnet bridge)"
+      fi
+    fi
+  done
+
+  if [ -n "$CONFIG" ]; then
+    say "Project $NAME"
+    info "config     $CONFIG"
+    info "source     $LOCAL_ROOT$(git -C "$LOCAL_ROOT" log -1 --format=' @ %h on ' 2>/dev/null)$(git -C "$LOCAL_ROOT" branch --show-current 2>/dev/null)"
+    info "sync       ${SYNC[*]} -> ~/$REMOTE_DIR"
+    info "build      ${WORKSPACE:+workspace $WORKSPACE}${PROJECT:+project $PROJECT}, scheme $SCHEME, in $XCODE_DIR"
+    info "bundle id  $BUNDLE_ID (team $TEAM)"
+    [ -d "$LOCAL_ROOT" ] || { info "MISSING    $LOCAL_ROOT"; problems=$((problems + 1)); }
+  fi
+
+  say "Verdict"
+  if [ -n "$usable" ] && [ "$problems" -eq 0 ]; then info "ready: would use $usable"; return 0; fi
+  [ -n "$usable" ] || info "no build Mac can reach the phone right now"
+  [ "$problems" -eq 0 ] || info "$problems local problem(s) above"
+  return 1
+}
+
+if [ "$COMMAND" = doctor ]; then doctor; exit $?; fi
+
+# ---------------------------------------------------------------- choose a host
+say "Checking build Macs for $DEVICE"
+CHOSEN=''
+for host in "${HOSTS[@]}"; do
+  probe_host "$host"
+  if [ "$(fact "$host" REACHABLE)" != yes ]; then info "$host: unreachable"; continue; fi
+  info "$host: phone $(fact "$host" DEV_STATE)"
+done
+for host in "${HOSTS[@]}"; do            # first choice: the phone is directly available
+  if [ "$(fact "$host" REACHABLE)" = yes ] && device_available "$host"; then CHOSEN=$host; break; fi
+done
+if [ -z "$CHOSEN" ]; then                # otherwise a Mac that is paired and can use the bridge
+  for host in "${HOSTS[@]}"; do
+    if [ "$(fact "$host" DEV_PAIRING)" = paired ]; then CHOSEN=$host; break; fi
+  done
+fi
+if [ -z "$CHOSEN" ]; then
+  if [ "$NO_INSTALL" = 1 ]; then
+    for host in "${HOSTS[@]}"; do [ "$(fact "$host" REACHABLE)" = yes ] && { CHOSEN=$host; break; }; done
+  fi
+  [ -n "$CHOSEN" ] || die "no build Mac is paired with $DEVICE. Pair it once in Xcode (USB or same Wi-Fi), or run: ios-install doctor"
+fi
+[ "$(fact "$CHOSEN" GUI)" = yes ] || [ "$SKIP_BUILD" = 1 ] || die "$CHOSEN has no logged-in desktop session, so codesign cannot reach the login keychain"
+REMOTE_HOME=$(fact "$CHOSEN" HOME)
+TARGET="$SSH_USER@$CHOSEN"
+STATE_DIR="$REMOTE_HOME/.cache/ios-install/$NAME"
+LABEL="tools.ios-install.$NAME"
+XCODE_PATH="$REMOTE_HOME/$REMOTE_DIR/$XCODE_DIR"
+APP_PATH="$XCODE_PATH/$DERIVED_DATA/Build/Products/Release-iphoneos/$PRODUCT"
+
+NEED_BRIDGE=0
+if [ "$NO_INSTALL" = 0 ]; then
+  case "$BRIDGE_MODE" in
+    always) NEED_BRIDGE=1 ;;
+    auto) device_available "$CHOSEN" || NEED_BRIDGE=1 ;;
+    never) device_available "$CHOSEN" || die "$DEVICE is not available on $CHOSEN and --bridge never was given" ;;
+  esac
+fi
+
+say "Plan"
+info "project  $NAME ($BUNDLE_ID)"
+info "source   $LOCAL_ROOT$(git -C "$LOCAL_ROOT" log -1 --format=' @ %h on ' 2>/dev/null)$(git -C "$LOCAL_ROOT" branch --show-current 2>/dev/null)"
+info "host     $CHOSEN ($(fact "$CHOSEN" XCODE), LAN $(fact "$CHOSEN" LAN_IP))"
+info "phone    $(fact "$CHOSEN" DEV_STATE) on $CHOSEN; bridge $([ "$NEED_BRIDGE" = 1 ] && echo needed || echo 'not needed')"
+[ "$DRY" = 1 ] && info "dry run: nothing below is executed"
+
+# ---------------------------------------------------------------- sync
+if [ "$SKIP_SYNC" = 0 ]; then
+  say "Syncing source to $CHOSEN:~/$REMOTE_DIR"
+  [ -d "$LOCAL_ROOT" ] || die "no source directory $LOCAL_ROOT"
+  # Never synced: build output, local Xcode state, and anything that looks like a secret.
+  excludes=(--exclude=.git --exclude=build --exclude=build-device --exclude=.build --exclude=xcuserdata
+            --exclude=__pycache__ --exclude=.DS_Store --exclude=.env '--exclude=.env.*')
+  for pattern in "${SYNC_EXCLUDES[@]}"; do excludes+=("--exclude=$pattern"); done
+  sources=()
+  for item in "${SYNC[@]}"; do
+    [ -e "$LOCAL_ROOT/${item%/}" ] || die "SYNC entry $item does not exist in $LOCAL_ROOT"
+    sources+=("$LOCAL_ROOT/$item")
+  done
+  sync_command=(rsync -az --info=stats1 -e "$RSYNC_SSH" "${excludes[@]}" "${sources[@]}" "$TARGET:$REMOTE_DIR/")
+  if [ "$DRY" = 1 ]; then
+    printf '   '; printf ' %q' "${sync_command[@]}"; echo
+  else
+    "${SSH[@]}" "$TARGET" "mkdir -p \"\$HOME\"/$(printf %q "$REMOTE_DIR")"
+    "${sync_command[@]}" | sed -n 's/^\(Number of regular files transferred.*\)/    \1/p'
+  fi
+fi
+
+# ---------------------------------------------------------------- prebuild
+if [ "$SKIP_BUILD" = 0 ] && [ "$SKIP_PREBUILD" = 0 ] && [ -n "$PREBUILD" ]; then
+  say "Running the prebuild step on $CHOSEN"
+  if [ "$DRY" = 1 ]; then
+    sed 's/^/    /' <<<"$PREBUILD"
+  else
+    remote "$CHOSEN" "DIR=$REMOTE_DIR" "PREBUILD=$PREBUILD" <<'REMOTE'
+set -e
+cd "$HOME/$DIR"
+eval "$PREBUILD"
+REMOTE
+  fi
+fi
+
+# ---------------------------------------------------------------- build
+# codesign over plain ssh fails with errSecInternalComponent because the login
+# keychain is only unlocked in the desktop session. The build therefore runs as
+# a one-off LaunchAgent in gui/<uid>: no KeepAlive (a respawn would start a
+# second xcodebuild and deadlock on build.db), and it is booted out afterwards.
+if [ "$SKIP_BUILD" = 0 ]; then
+  say "Building signed Release on $CHOSEN (desktop session)"
+  if [ "${FACTS[$CHOSEN.SCHEME_BUILDS]:-0}" != 0 ] && [ "$FORCE" = 0 ]; then
+    die "an xcodebuild for scheme $SCHEME is already running on $CHOSEN; wait for it or pass --force"
+  fi
+  container=(-project "$PROJECT"); [ -n "$WORKSPACE" ] && container=(-workspace "$WORKSPACE")
+  # generic/platform=iOS keeps the build independent of the phone's connection.
+  build_command=(xcodebuild "${container[@]}" -scheme "$SCHEME" -configuration Release
+                 -destination generic/platform=iOS -derivedDataPath "$DERIVED_DATA"
+                 -allowProvisioningUpdates "DEVELOPMENT_TEAM=$TEAM" "${XCODEBUILD_ARGS[@]}" build)
+  build_script=$(
+    printf '#!/bin/bash\n%s\ncd %q || exit 97\n' "$REMOTE_ENV" "$XCODE_PATH"
+    printf '%q ' "${build_command[@]}"
+    printf '\necho $? > %q\n' "$STATE_DIR/build.exit"
+  )
+  build_plist=$(cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$STATE_DIR/build.sh</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>$STATE_DIR/build.log</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/build.log</string>
+</dict></plist>
+PLIST
+  )
+  if [ "$DRY" = 1 ]; then
+    info "LaunchAgent $LABEL in gui/$(fact "$CHOSEN" UID), log $STATE_DIR/build.log, running:"
+    sed 's/^/      /' <<<"$build_script"
+  else
+    remote "$CHOSEN" "STATE=$STATE_DIR" "LABEL=$LABEL" "SCRIPT=$build_script" "PLIST=$build_plist" <<'REMOTE'
+set -e
+mkdir -p "$STATE"
+domain="gui/$(id -u)"
+if launchctl print "$domain/$LABEL" >/dev/null 2>&1; then
+  if launchctl print "$domain/$LABEL" | grep -q 'state = running'; then
+    echo "a build for this project is still running (label $LABEL)" >&2; exit 75
+  fi
+  launchctl bootout "$domain/$LABEL" 2>/dev/null || true
+fi
+rm -f "$STATE/build.exit"
+printf '%s\n' "$SCRIPT" >"$STATE/build.sh"
+printf '%s\n' "$PLIST" >"$STATE/build.plist"
+: >"$STATE/build.log"
+launchctl bootstrap "$domain" "$STATE/build.plist"
+REMOTE
+    # Poll in short ssh calls: a dropped connection cannot kill or orphan the build.
+    started=$SECONDS status=''
+    while :; do
+      sleep 10
+      status=$("${SSH[@]}" "$TARGET" "cat $(printf %q "$STATE_DIR/build.exit") 2>/dev/null || { printf 'running '; grep -c . $(printf %q "$STATE_DIR/build.log"); }" 2>/dev/null) || status='running ?'
+      case "$status" in running*) printf '\r    %4ds, %s log lines' "$((SECONDS - started))" "${status#running }" ;; *) break ;; esac
+    done
+    echo
+    "${SSH[@]}" "$TARGET" "launchctl bootout gui/\$(id -u)/$LABEL 2>/dev/null || true"
+    if [ "$status" != 0 ]; then
+      "${SSH[@]}" "$TARGET" "grep -E 'error:|errSec|BUILD FAILED|Provisioning|requires a provisioning' $(printf %q "$STATE_DIR/build.log") | tail -20; tail -5 $(printf %q "$STATE_DIR/build.log")" >&2 || true
+      die "build failed with exit $status; full log on $CHOSEN: $STATE_DIR/build.log"
+    fi
+    info "BUILD SUCCEEDED in $((SECONDS - started))s"
+  fi
+fi
+
+# ---------------------------------------------------------------- verify
+say "Verifying the signed app"
+if [ "$DRY" = 1 ]; then
+  info "codesign --verify --deep --strict $APP_PATH"
+  info "codesign -d --entitlements - $APP_PATH   (must include: ${REQUIRE_ENTITLEMENTS[*]:-nothing required})"
+else
+  remote "$CHOSEN" "APP=$APP_PATH" "REQUIRED=${REQUIRE_ENTITLEMENTS[*]:-}" "BUNDLE_ID=$BUNDLE_ID" <<'REMOTE' | sed 's/^/    /'
+set -e
+[ -d "$APP" ] || { echo "no app at $APP" >&2; exit 1; }
+codesign --verify --deep --strict "$APP"
+[ -f "$APP/embedded.mobileprovision" ] || { echo "no embedded provisioning profile: not a device build" >&2; exit 1; }
+echo "built      $(stat -f '%Sm' "$APP")"
+echo "version    $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist") ($(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist"))"
+actual=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+[ "$actual" = "$BUNDLE_ID" ] || { echo "bundle id is $actual, expected $BUNDLE_ID" >&2; exit 1; }
+entitlements=$(codesign -d --entitlements - --xml "$APP" 2>/dev/null | plutil -p - 2>/dev/null || codesign -d --entitlements - "$APP" 2>&1)
+echo "entitlements:"
+printf '%s\n' "$entitlements" | sed 's/^/  /'
+for key in $REQUIRED; do
+  printf '%s' "$entitlements" | grep -q "$key" || { echo "missing required entitlement $key" >&2; exit 1; }
+done
+REMOTE
+fi
+
+[ "$NO_INSTALL" = 1 ] && { say "Done (install skipped)"; exit 0; }
+
+# ---------------------------------------------------------------- bridge
+# Only when the Mac cannot already see the phone: republish the phone's
+# _remotepairing advert on the Mac and relay its tunnel ports over Tailscale.
+BRIDGE_UP=0
+stop_bridge() {
+  [ "$BRIDGE_UP" = 1 ] || return 0
+  BRIDGE_UP=0
+  "${SSH[@]}" "$TARGET" 'pkill -f ios-install/coredevice-tailnet-bridge.py' 2>/dev/null || true
+  info "bridge stopped"
+}
+trap stop_bridge EXIT
+
+if [ "$NEED_BRIDGE" = 1 ]; then
+  say "Starting the CoreDevice tailnet bridge on $CHOSEN"
+  [ "$(fact "$CHOSEN" DEV_PAIRING)" = paired ] || die "$DEVICE is not paired with $CHOSEN; the bridge only relays an existing pairing. Pair once in Xcode over USB or shared Wi-Fi."
+  discover_phone_tailscale
+  [ -n "$PHONE_TS_IP" ] || die "cannot find the phone on Tailscale: $PHONE_TS_NOTE"
+  discover_advert
+  [ -n "$ADVERT_INSTANCE" ] || die "the phone is not advertising _remotepairing on this LAN: unlock it and put it on this machine's Wi-Fi"
+  bind_ip=$(fact "$CHOSEN" LAN_IP)
+  [ -n "$bind_ip" ] || die "could not determine $CHOSEN's LAN address"
+  info "phone    $ADVERT_HOST LAN $ADVERT_IP:$ADVERT_PORT, Tailscale $PHONE_TS_IP ($PHONE_TS_NOTE)"
+  info "relay    $CHOSEN binds $bind_ip"
+  ports=$(phone_tunnel_ports "$ADVERT_IP")
+  info "ports    $ports"
+  bridge_args=(--bind "$bind_ip" --phone "$PHONE_TS_IP" --instance "$ADVERT_INSTANCE"
+               --hostname "$ADVERT_HOST" --service-port "$ADVERT_PORT" --ports "$ports")
+  for item in "${ADVERT_TXT[@]}"; do bridge_args+=(--txt "$item"); done
+  if [ "$DRY" = 1 ]; then
+    printf '    python3 ~/.cache/ios-install/coredevice-tailnet-bridge.py'; printf ' %q' "${bridge_args[@]}"; echo
+  else
+    "${SSH[@]}" "$TARGET" 'mkdir -p ~/.cache/ios-install'
+    rsync -az -e "$RSYNC_SSH" "$BRIDGE_SRC" "$TARGET:.cache/ios-install/coredevice-tailnet-bridge.py"
+    BRIDGE_UP=1
+    remote "$CHOSEN" "ARGS=$(printf '%q ' "${bridge_args[@]}")" "UDID=$(fact "$CHOSEN" DEV_UDID)" <<'REMOTE'
+ulimit -n 8192     # one TCP and one UDP socket per relayed port
+pkill -f ios-install/coredevice-tailnet-bridge.py 2>/dev/null || true
+cd "$HOME/.cache/ios-install"
+eval "nohup /usr/bin/python3 ./coredevice-tailnet-bridge.py $ARGS" >bridge.log 2>&1 </dev/null &
+for _ in $(seq 1 30); do
+  sleep 2
+  xcrun devicectl list devices 2>/dev/null | grep "$UDID" | grep -Eq '[[:space:]]available' && { echo "    phone available through the bridge"; exit 0; }
+  kill -0 $! 2>/dev/null || { echo "bridge exited:" >&2; tail -5 bridge.log >&2; exit 1; }
+done
+echo "phone did not become available within 60s; bridge log:" >&2; tail -5 bridge.log >&2; exit 1
+REMOTE
+  fi
+fi
+
+# ---------------------------------------------------------------- install + launch
+# Install over the existing app: same bundle id + compatible signing keeps its data.
+say "Installing on $DEVICE"
+device_id=$(fact "$CHOSEN" DEV_ID)
+if [ "$DRY" = 1 ]; then
+  info "xcrun devicectl device install app --device $device_id $APP_PATH"
+  [ "$NO_LAUNCH" = 1 ] || info "xcrun devicectl device process launch --device $device_id $BUNDLE_ID"
+  say "Dry run complete"
+  exit 0
+fi
+remote "$CHOSEN" "APP=$APP_PATH" "DEVICE_ID=$device_id" "BUNDLE_ID=$BUNDLE_ID" "LAUNCH=$((1 - NO_LAUNCH))" <<'REMOTE' | sed 's/^/    /'
+set -e
+output=$(xcrun devicectl device install app --device "$DEVICE_ID" "$APP" 2>&1) || { printf '%s\n' "$output" >&2; echo "install failed" >&2; exit 1; }
+printf '%s\n' "$output" | grep -E 'App installed|bundleID' || true
+if [ "$LAUNCH" = 1 ]; then
+  xcrun devicectl device process launch --device "$DEVICE_ID" "$BUNDLE_ID" 2>&1 | grep -E 'Launched' ||
+    echo "installed, but launch failed (is the phone locked?)"
+fi
+REMOTE
+stop_bridge
+say "Done: $NAME installed on $DEVICE from $CHOSEN"

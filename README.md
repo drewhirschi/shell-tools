@@ -70,6 +70,21 @@ export FW_ROOT="$HOME/src"
 
 **Requires** `git`, `fzf`.
 
+### `ios-install` — build and install an iOS app on the iPhone
+
+One script for every iOS project: syncs the source to a build Mac, builds a
+signed Release in its desktop session, verifies the signature and entitlements,
+and installs on the phone, starting the CoreDevice tailnet bridge only when the
+Mac cannot already see it. Details and per-project config: [ios/README.md](ios/README.md).
+
+```
+ios-install doctor
+ios-install -n trustdeeds     # dry run
+ios-install trustdeeds
+```
+
+It is a script in `bin/`, which the loader puts on `$PATH`.
+
 ## Adding a tool
 
 Drop `functions/<name>.sh` in, defining a function of the same name. The loader
