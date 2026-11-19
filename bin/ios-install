@@ -394,7 +394,7 @@ if [ "$SKIP_SYNC" = 0 ]; then
     [ -e "$LOCAL_ROOT/${item%/}" ] || die "SYNC entry $item does not exist in $LOCAL_ROOT"
     sources+=("$LOCAL_ROOT/$item")
   done
-  sync_command=(rsync -az --info=stats1 -e "$RSYNC_SSH" "${excludes[@]}" "${sources[@]}" "$TARGET:$REMOTE_DIR/")
+  sync_command=(rsync -az --stats -e "$RSYNC_SSH" "${excludes[@]}" "${sources[@]}" "$TARGET:$REMOTE_DIR/")
   if [ "$DRY" = 1 ]; then
     printf '   '; printf ' %q' "${sync_command[@]}"; echo
   else
